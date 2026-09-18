@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Run a command inside the cbqri-io build container, with the repo mounted at the
+# same path. `./dev` alone gives a shell.
+#   ./dev make qemu
+#   ./dev scripts/run.sh
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+image=cbqri-io-dev
+
+if ! docker image inspect "$image" >/dev/null 2>&1 || [[ "${REBUILD:-}" == 1 ]]; then
+    docker build -t "$image" \
+        --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" \
+        "$here/docker"
+fi
+
+tty=()
+[[ -t 0 && -t 1 ]] && tty=(-it)
+# DETACH=<name>: run in a named background container (used by scripts/up.sh
+# for the long-lived guest; `docker logs <name>` is its serial console).
+[[ -n ${DETACH:-} ]] && tty=(-d --name "$DETACH")
+kvm=()
+[[ -e /dev/kvm ]] && kvm=(--device /dev/kvm)
+
+exec docker run --rm "${tty[@]}" "${kvm[@]}" \
+    -v "$here:$here" -w "$here" \
+    -e TERM="${TERM:-xterm}" \
+    --network host \
+    "$image" "${@:-bash}"

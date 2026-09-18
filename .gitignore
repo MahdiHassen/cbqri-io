@@ -1,0 +1,6 @@
+/src/
+/build/
+/images/
+/results/
+*.log
+__pycache__/

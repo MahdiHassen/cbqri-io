@@ -1,0 +1,82 @@
+From 6080bc3832621436a6201d578c1f65d6bdd40dd1 Mon Sep 17 00:00:00 2001
+From: cbqri <cbqri@localhost>
+Date: Fri, 18 Sep 2026 14:54:02 -0400
+Subject: [PATCH 2/2] iommu/riscv: identity-map IMSIC interrupt files for DMA
+ domains
+
+With translated default domains, PCI MSI writes to the IMSIC go through
+the S-stage page table like any other DMA, and fault because nothing maps
+them (the driver does not use MSI page tables / msiptp, and the IMSIC
+driver does not call iommu_dma_prepare_msi()).
+
+Report each hart's S-level interrupt file as an IOMMU_RESV_DIRECT region:
+the core then maps it 1:1 in every default domain and keeps it out of the
+IOVA allocator, so MSI addresses need no rewriting.
+
+Prototype-quality: it assumes guest index 0 (S-level files only) and
+blocks attaching the device to a non-default (e.g. VFIO) domain.
+---
+ drivers/iommu/riscv/iommu.c | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/drivers/iommu/riscv/iommu.c b/drivers/iommu/riscv/iommu.c
+index cec3ddd7a..4e33b897d 100644
+--- a/drivers/iommu/riscv/iommu.c
++++ b/drivers/iommu/riscv/iommu.c
+@@ -19,6 +19,7 @@
+ #include <linux/init.h>
+ #include <linux/iommu.h>
+ #include <linux/iopoll.h>
++#include <linux/irqchip/riscv-imsic.h>
+ #include <linux/kernel.h>
+ #include <linux/pci.h>
+ #include <linux/generic_pt/iommu.h>
+@@ -1481,6 +1482,37 @@ static void riscv_iommu_release_device(struct device *dev)
+ 	kfree_rcu_mightsleep(info);
+ }
+ 
++/*
++ * The Linux driver does not program MSI page tables (msiptp), so device MSI
++ * writes to IMSIC interrupt files are translated like any other DMA. With
++ * IOMMU_DMA default domains they would fault. Identity-map each hart's
++ * S-level interrupt file in every default domain, so MSI addresses composed
++ * by the IMSIC driver work unchanged.
++ */
++static void riscv_iommu_get_resv_regions(struct device *dev,
++					 struct list_head *head)
++{
++	const struct imsic_global_config *gc = imsic_get_global_config();
++	struct iommu_resv_region *region;
++	unsigned int cpu;
++
++	if (!gc)
++		return;
++
++	for_each_possible_cpu(cpu) {
++		phys_addr_t pa = per_cpu_ptr(gc->local, cpu)->msi_pa;
++
++		if (!pa)
++			continue;
++		region = iommu_alloc_resv_region(pa, IMSIC_MMIO_PAGE_SZ,
++						 IOMMU_WRITE | IOMMU_MMIO,
++						 IOMMU_RESV_DIRECT, GFP_KERNEL);
++		if (!region)
++			return;
++		list_add_tail(&region->list, head);
++	}
++}
++
+ static const struct iommu_ops riscv_iommu_ops = {
+ 	.of_xlate = riscv_iommu_of_xlate,
+ 	.identity_domain = &riscv_iommu_identity_domain,
+@@ -1490,6 +1522,7 @@ static const struct iommu_ops riscv_iommu_ops = {
+ 	.device_group = riscv_iommu_device_group,
+ 	.probe_device = riscv_iommu_probe_device,
+ 	.release_device	= riscv_iommu_release_device,
++	.get_resv_regions = riscv_iommu_get_resv_regions,
+ };
+ 
+ static int riscv_iommu_init_check(struct riscv_iommu_device *iommu)
+-- 
+2.53.0
+

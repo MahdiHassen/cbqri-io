@@ -1,0 +1,149 @@
+#!/usr/bin/env bpftrace
+/*
+ * Stage 0: what label *would* each NVMe DMA mapping carry, under each candidate
+ * labeling policy? No kernel or QEMU changes; runs in the guest.
+ *
+ * A request's mappings happen between nvme_setup_cmd() and block_rq_issue
+ * (nvme_prep_rq: setup_cmd -> map_data -> start_request), on one thread, for
+ * both ->queue_rq and the batched ->queue_rqs path. Every iommu_map_nosync()
+ * inside that window belongs to the request.
+ *
+ * Output, one line per request:
+ *   R ts sector bytes rwbs cur_cg blkcg_cg page_cg_first page_cg_last nmap map_bytes domain comm
+ * where the *_cg fields are cgroup v2 ids (the same ids as bpftrace `cgroup`
+ * and `stat -c %i /sys/fs/cgroup/...`), 0 = none/unknown:
+ *   cur_cg      `current` at map time          (policy: tag by submitting task)
+ *   blkcg_cg    rq->bio->bi_blkg               (policy: what blk-cgroup charges;
+ *                                               writeback = inode-owner heuristic)
+ *   page_cg_*   memcg of the first/last page   (policy: tag by buffer owner)
+ *               In 7.2 folio->memcg_data points to an obj_cgroup (so folios
+ *               can be reparented), not the memcg: page -> objcg -> memcg.
+ * and at exit, per-IOMMU-domain op counts as bpftrace maps keyed by domain:
+ *   @maps @map_bytes @unmaps @unmap_bytes @syncs @flush_all
+ */
+
+fentry:vmlinux:nvme_setup_cmd
+{
+	@rq[tid] = (uint64)args.req;
+	@nmap[tid] = (uint64)0;
+	@mbytes[tid] = (uint64)0;
+}
+
+fentry:vmlinux:iommu_map_nosync
+{
+	@maps[(uint64)args.domain] = count();
+	@map_bytes[(uint64)args.domain] = sum(args.size);
+	if (@rq[tid]) {
+		@nmap[tid] += 1;
+		@mbytes[tid] += args.size;
+		@dom[tid] = (uint64)args.domain;
+	}
+}
+
+tracepoint:block:block_rq_issue
+/@rq[tid]/
+{
+	$rq = (struct request *)@rq[tid];
+	$blkcg = (uint64)0;
+	$pfirst = (uint64)0;
+	$plast = (uint64)0;
+
+	$bio = $rq->bio;
+	if ($bio != 0) {
+		if ($bio->bi_blkg != 0) {
+			$blkcg = $bio->bi_blkg->blkcg->css.cgroup->kn->id;
+		}
+
+		/*
+		 * Pages are located through bi_iter, never bi_vcnt: bios that blk-mq
+		 * split are clones that share the parent's bi_io_vec with bi_vcnt == 0.
+		 * A multi-page bvec's page for byte offset o is bv_page + o/PAGE_SIZE.
+		 */
+
+		/* First page of the request: start of the first bio's iterator. */
+		$bv = (struct bio_vec *)((uint64)$bio->bi_io_vec +
+		                         $bio->bi_iter.bi_idx * sizeof(struct bio_vec));
+		$pg = (uint64)$bv->bv_page +
+		      (($bv->bv_offset + $bio->bi_iter.bi_bvec_done) >> 12) * sizeof(struct page);
+		/* compound_head(), mask encoding (CONFIG_HUGETLB_PAGE_OPTIMIZE_VMEMMAP=y,
+		 * sizeof(struct page) == 64): tail pages have bit 0 set and the rest is
+		 * a mask that turns the tail address into the head address. */
+		$info = ((struct page *)$pg)->compound_info;
+		if ($info & 1) { $pg = $pg & $info; }
+		$md = ((struct page *)$pg)->memcg_data;
+		if ($md != 0 && ($md & 1) == 0) {
+			$pfirst = ((struct obj_cgroup *)($md & ~(uint64)7))->memcg->css.cgroup->kn->id;
+		}
+
+		/* Last page of the request: walk the last bio's iterator to its end. */
+		$lb = $rq->biotail;
+		$idx = (uint64)$lb->bi_iter.bi_idx;
+		$done = (uint64)$lb->bi_iter.bi_bvec_done;
+		$left = (uint64)$lb->bi_iter.bi_size;
+		$pg = (uint64)0;
+		$i = 0;
+		while ($i < 64) {
+			$bv = (struct bio_vec *)((uint64)$lb->bi_io_vec + $idx * sizeof(struct bio_vec));
+			$seg = (uint64)$bv->bv_len - $done;
+			if ($left <= $seg) {
+				$pg = (uint64)$bv->bv_page +
+				      (($bv->bv_offset + $done + $left - 1) >> 12) * sizeof(struct page);
+				break;
+			}
+			$left -= $seg;
+			$done = 0;
+			$idx += 1;
+			$i += 1;
+		}
+		if ($pg != 0) {
+			$info = ((struct page *)$pg)->compound_info;
+			if ($info & 1) { $pg = $pg & $info; }
+			$md = ((struct page *)$pg)->memcg_data;
+			if ($md != 0 && ($md & 1) == 0) {
+				$plast = ((struct obj_cgroup *)($md & ~(uint64)7))->memcg->css.cgroup->kn->id;
+			}
+		}
+	}
+
+	printf("R %llu %llu %u %s %llu %llu %llu %llu %llu %llu 0x%llx %s\n",
+	       nsecs, args.sector, args.bytes, args.rwbs, cgroup, $blkcg,
+	       $pfirst, $plast, @nmap[tid], @mbytes[tid], @dom[tid], comm);
+
+	delete(@rq[tid]);
+	delete(@nmap[tid]);
+	delete(@mbytes[tid]);
+	delete(@dom[tid]);
+}
+
+/* Separate probes: the two have different signatures (unmap_fast takes a gather). */
+fentry:vmlinux:iommu_unmap_fast
+{
+	@unmaps[(uint64)args.domain] = count();
+	@unmap_bytes[(uint64)args.domain] = sum(args.size);
+}
+
+fentry:vmlinux:iommu_unmap
+{
+	@unmaps[(uint64)args.domain] = count();
+	@unmap_bytes[(uint64)args.domain] = sum(args.size);
+}
+
+fentry:vmlinux:riscv_iommu_iotlb_sync
+{
+	@syncs[(uint64)args.iommu_domain] = count();
+}
+
+fentry:vmlinux:riscv_iommu_iotlb_flush_all
+{
+	@flush_all[(uint64)args.iommu_domain] = count();
+}
+
+END
+{
+	clear(@rq); clear(@nmap); clear(@mbytes); clear(@dom);
+	print(@maps); print(@map_bytes);
+	print(@unmaps); print(@unmap_bytes);
+	print(@syncs); print(@flush_all);
+	clear(@maps); clear(@map_bytes); clear(@unmaps); clear(@unmap_bytes);
+	clear(@syncs); clear(@flush_all);
+}
